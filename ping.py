@@ -1,118 +1,130 @@
-from socket import *
-import os
-import sys
-import struct
-import time
-import select
-import binascii
+from socket import *           # Import all socket functions (e.g., socket(), gethostbyname(), etc.)
+import os                      # For getting process ID
+import sys                     # For checking platform (e.g., Darwin/Mac)
+import struct                  # For packing/unpacking binary data
+import time                    # For timestamps and sleep
+import select                  # For waiting on a socket with a timeout
 
-ICMP_ECHO_REQUEST = 8
+ICMP_ECHO_REQUEST = 8          # ICMP type code for echo request packets (ping)
 
-def checksum(string):
+def checksum(source_bytes):
+    """
+    Compute the Internet Checksum of the supplied bytes.
+    This function works correctly in Python 3.
+    """
     csum = 0
-    countTo = (len(string) // 2) * 2
+    countTo = (len(source_bytes) // 2) * 2
     count = 0
 
+    # Handle two bytes at a time
     while count < countTo:
-        thisVal = ord(string[count+1]) * 256 + ord(string[count])
+        thisVal = source_bytes[count + 1] * 256 + source_bytes[count]
         csum = csum + thisVal
         csum = csum & 0xffffffff
-        count = count + 2
+        count += 2
 
-        if countTo < len(string):
-            csum = csum + ord(string[len(string) - 1])
-            csum = csum & 0xffffffff
-            
-        csum = (csum >> 16) + (csum & 0xffff)
-        csum = csum + (csum >> 16)
-        answer = ~csum
-        answer = answer & 0xffff
-        answer = answer >> 8 | (answer << 8 & 0xff00)
-        return answer
+    # Handle last byte if odd length
+    if countTo < len(source_bytes):
+        csum += source_bytes[-1]
+        csum = csum & 0xffffffff
+
+    # Final fold and complement
+    csum = (csum >> 16) + (csum & 0xffff)
+    csum += (csum >> 16)
+    answer = ~csum & 0xffff
+    answer = answer >> 8 | (answer << 8 & 0xff00)  # Swap bytes
+    return answer
 
 def receiveOnePing(mySocket, ID, timeout, destAddr):
+    """
+    Wait for a ping reply from the socket.
+    Match by packet ID.
+    """
     timeLeft = timeout
-    while 1:
+    while True:
         startedSelect = time.time()
         whatReady = select.select([mySocket], [], [], timeLeft)
-        howLongInSelect = (time.time() - startedSelect)
-        if whatReady[0] == []: # Timeout
+        howLongInSelect = time.time() - startedSelect
+
+        if whatReady[0] == []:  # Timeout
             return "Request timed out."
 
         timeReceived = time.time()
         recPacket, addr = mySocket.recvfrom(1024)
 
-        # Fill in start
-        # The IP header is the first 20 bytes
+        # ICMP header is after the first 20 bytes (IP header)
         icmpHeader = recPacket[20:28]
-        type, code, checksum, packetID, sequence = struct.unpack("bbHHh", icmpHeader)
+        type, code, checksum_recv, packetID, sequence = struct.unpack("bbHHh", icmpHeader)
 
         if packetID == ID:
-            # Match found: compute round-trip time
-            dataBytes = recPacket[28:]  # The rest is the payload
-            timeSent = struct.unpack("d", dataBytes)[0]
-            return f"Reply from {addr[0]}: time={(timeReceived - timeSent)*1000:.2f}ms"
-        # Fill in end
+            # Match found — extract the sent time from the payload
+            timeSent = struct.unpack("d", recPacket[28:28 + 8])[0]
+            rtt = (timeReceived - timeSent) * 1000  # Round-trip time in ms
+            return f"Reply from {addr[0]}: time={rtt:.2f}ms"
 
-        timeLeft = timeLeft - howLongInSelect
+        timeLeft -= howLongInSelect
         if timeLeft <= 0:
             return "Request timed out."
 
 def sendOnePing(mySocket, destAddr, ID):
-    # Header is type (8), code (8), checksum (16), id (16), sequence (16)
+    """
+    Create and send one ICMP ECHO_REQUEST packet.
+    """
     myChecksum = 0
-    # Make a dummy header with a 0 checksum
-
-    # struct -- Interpret strings as packed binary data
+    # Build ICMP header: type (8), code (0), checksum (0), ID, sequence number (1)
     header = struct.pack("bbHHh", ICMP_ECHO_REQUEST, 0, myChecksum, ID, 1)
+    # Payload is the current time as a double (8 bytes)
     data = struct.pack("d", time.time())
-    # Calculate the checksum on the data and the dummy header.
-    myChecksum = checksum(str(header + data))
+    # Compute checksum on header + data
+    myChecksum = checksum(header + data)
 
-    # Get the right checksum, and put in the header
     if sys.platform == 'darwin':
-        # Convert 16-bit integers from host to network byte order
-        myChecksum = htons(myChecksum) & 0xffff
+        myChecksum = htons(myChecksum) & 0xffff  # On macOS
     else:
-        myChecksum = htons(myChecksum)
-        
+        myChecksum = htons(myChecksum)           # On Linux/other
+
+    # Final header with correct checksum
     header = struct.pack("bbHHh", ICMP_ECHO_REQUEST, 0, myChecksum, ID, 1)
     packet = header + data
 
-    mySocket.sendto(packet, (destAddr, 1)) # AF_INET address must be tuple, not str
-    # Both LISTS and TUPLES consist of a number of objects
-    # which can be referenced by their position number within the object.
-    
+    # Send packet to the destination address, port is irrelevant for ICMP
+    mySocket.sendto(packet, (destAddr, 1))
+
 def doOnePing(destAddr, timeout):
-    icmp = getprotobyname("icmp")
-    # SOCK_RAW is a powerful socket type. For more details: http://sock-raw.org/papers/sock_raw
-    mySocket = socket(AF_INET, SOCK_RAW, icmp)
-    myID = os.getpid() & 0xFFFF # Return the current process i
-    sendOnePing(mySocket, destAddr, myID)
-    delay = receiveOnePing(mySocket, myID, timeout, destAddr)
+    """
+    High-level function to perform one ping and return result.
+    """
+    icmp = getprotobyname("icmp")  # Get protocol number for ICMP (usually 1)
+    mySocket = socket(AF_INET, SOCK_RAW, icmp)  # Create raw socket
+    myID = os.getpid() & 0xFFFF                # Use process ID for packet ID
+
+    sendOnePing(mySocket, destAddr, myID)      # Send one ping
+    delay = receiveOnePing(mySocket, myID, timeout, destAddr)  # Wait for reply
 
     mySocket.close()
     return delay
 
 def ping(host, timeout=1):
-    # timeout=1 means: If one second goes by without a reply from the server,
-    # the client assumes that either the client's ping or the server's pong is lost
-    dest = gethostbyname(host)
+    """
+    Repeatedly ping a host once and return the response (break after one for now).
+    """
+    dest = gethostbyname(host)  # Resolve hostname to IP address
     print("Pinging " + dest + " using Python:")
     print("")
-    # Send ping requests to a server separated by approximately one second
-    while 1 :
-        delay = doOnePing(dest, timeout)
-        print(delay)
-        time.sleep(1) # one second
-        return delay
+
+    delay = doOnePing(dest, timeout)  # Single ping
+    print(delay)
+    time.sleep(1)
+    return delay
 
 if __name__ == "__main__":
-    # Four different continents
-    continents = { "asia" : "www.riken.jp",
-                   "europe" : "www.cam.ac.uk",
-                   "north_america" : "www.nrc-cnrc.gc.ca",
-                   "australia" : "www.abc.net.au" }
+    # Four websites representing different continents
+    continents = {
+        "asia": "www.riken.jp",
+        "europe": "www.cam.ac.uk",
+        "north_america": "www.nrc-cnrc.gc.ca",
+        "australia": "www.abc.net.au"
+    }
 
     for key, value in continents.items():
         print("Ping {}: {}".format(key, value))
