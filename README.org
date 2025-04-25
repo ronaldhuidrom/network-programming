@@ -1,0 +1,3 @@
+*** Network Programming
+
+Running ~ping.py~ and ~traceroute.py~ will need root permission. Run with ~sudo~.
